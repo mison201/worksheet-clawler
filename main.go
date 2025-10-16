@@ -3,10 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,28 +18,42 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
 )
 
+// ======================= CONFIG =======================
+
 const (
-	defaultRoot = "data_kiddo" // default PDF root
-	outSubDir   = "_merged"    // output dir under root
-	listenAddr  = ":8080"      // http server address
-	maxFileScan = 100000       // safety cap
+	defaultAddr = ":8080"
+	defaultOut  = "merged_output" // nơi lưu file merge đã tạo
 )
 
-// FileItem represents a discovered PDF file.
-type FileItem struct {
-	Path string // absolute path
-	Rel  string // relative path from root
-	Size int64
-	Mod  time.Time
+// ======================= DATA TYPES ===================
+
+type Item struct {
+	Title  string `json:"title"`
+	PDFURL string `json:"pdf_url"`
+	IMGURL string `json:"img_url"`              // thumbnail/cover để hiển thị
+	URL    string `json:"detail_url,omitempty"` // optional để debug
 }
 
-// ---- template helpers ----
+type MergeRequest struct {
+	Files []string `json:"files"` // danh sách PDF URL
+	Out   string   `json:"out"`   // tên file output (không có .pdf)
+}
+
+// ======================= FLAGS ========================
+
+var (
+	dataPath = flag.String("data", "items.jsonl", "path to data file (JSON array or JSONL) with fields: title,pdf_url,img_url")
+	addrFlag = flag.String("addr", defaultAddr, "http listen address, e.g. :8080")
+	outDir   = flag.String("out", defaultOut, "output directory for merged PDFs")
+)
+
+// ======================= TEMPLATE =====================
 
 var funcMap = template.FuncMap{
-	// convert interface{} (int64/float/int) to float64
 	"f64": func(n any) float64 {
 		switch v := n.(type) {
 		case int64:
@@ -48,8 +66,6 @@ var funcMap = template.FuncMap{
 			return 0
 		}
 	},
-	"div": func(a, b float64) float64 { return a / b },
-	"mul": func(a, b float64) float64 { return a * b },
 }
 
 var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
@@ -57,193 +73,144 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
 <html>
 <head>
   <meta charset="utf-8">
-  <title>PDF Merger</title>
+  <title>Worksheet PDF Picker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    :root { --bg:#fff; --fg:#111; --muted:#666; --border:#eee; }
-    * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; color: var(--fg); background: var(--bg); }
-    h1 { margin-top: 0; font-size: 22px; }
-    .wrap { display: grid; grid-template-columns: 1fr 360px; gap: 24px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-    tr:hover { background: #fafafa; }
-    .side { position: sticky; top: 20px; height: fit-content; }
-    .btn { padding: 10px 14px; border: 0; background: #111; color: #fff; border-radius: 8px; cursor: pointer; }
-    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    :root { --border:#eee; --muted:#666; }
+    * { box-sizing:border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    h1 { margin:0 0 16px 0; font-size:22px; }
+    .wrap { display:grid; grid-template-columns: 1.2fr 380px; gap:24px; }
+    .list { display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap:14px; }
+    .card { border:1px solid var(--border); border-radius:12px; overflow:hidden; display:flex; flex-direction:column; }
+    .thumb { width:100%; aspect-ratio:4/3; object-fit:cover; background:#fafafa; display:block; }
+    .meta { padding:10px 12px; display:flex; gap:8px; align-items:center; }
+    .title { font-weight:600; font-size:14px; line-height:1.4; }
+    .muted { color:var(--muted); font-size:12px; }
+    .pick { width:18px; height:18px; }
+    .order { width:70px; padding:8px; border:1px solid #ddd; border-radius:8px; }
+    .btn { padding:10px 14px; border:0; background:#111; color:#fff; border-radius:10px; cursor:pointer; }
+    .side { position:sticky; top:20px; height:fit-content; }
+    .box { border:1px solid var(--border); border-radius:12px; padding:12px; }
     .row { display:flex; gap:8px; align-items:center; }
-    input[type="text"], input[type="number"] { padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
-    input[type="number"] { width: 90px; }
-    .muted { color: var(--muted); font-size: 12px; }
-    .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:10px; }
-    .search { flex: 1; }
-    .small { font-size: 12px; }
-    .fileRow { cursor: default; }
-    .badge { background:#f2f2f2; border:1px solid #e6e6e6; border-radius:999px; padding:2px 8px; font-size:11px; color:#444; }
-    code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
-    @media (max-width: 900px) {
+    input[type="text"] { width:100%; padding:10px; border:1px solid #ddd; border-radius:8px; }
+    .toolbar { display:flex; gap:10px; margin-bottom:12px; align-items:center; }
+    .search { flex:1; }
+    .small { font-size:12px; }
+    iframe { width:100%; height:420px; border:0; border-radius:8px; }
+    @media (max-width: 980px) {
       .wrap { grid-template-columns: 1fr; }
       .side { position: static; }
     }
   </style>
 </head>
 <body>
-  <h1>PDF Merger</h1>
+  <h1>Worksheet Picker (from links)</h1>
 
   <div class="toolbar">
-    <input id="q" class="search" type="text" placeholder="Filter by name...">
-    <span class="small">Root: <code>{{.Root}}</code></span>
-    <span class="badge" id="countBadge"></span>
+    <input id="q" class="search" type="text" placeholder="Filter by title...">
+    <span class="small" id="countLabel"></span>
   </div>
 
   <div class="wrap">
     <div>
-      <table id="tbl">
-        <thead>
-          <tr>
-            <th style="width:56px;">Pick</th>
-            <th>PDF</th>
-            <th style="width:210px;">Order & Preview</th>
-          </tr>
-        </thead>
-        <tbody id="tbody">
-          {{range $i, $f := .Files}}
-          <tr class="fileRow" data-rel="{{ $f.Rel }}" data-name="{{ $f.Rel }}">
-            <td><input type="checkbox" class="pick" data-rel="{{ $f.Rel }}"></td>
-            <td>
-              <div><strong>{{$f.Rel}}</strong></div>
-              <div class="muted">{{printf "%.2f" (div (f64 $f.Size) 1048576.0)}} MB · {{$f.Mod.Format "2006-01-02 15:04"}}</div>
-            </td>
-            <td>
-              <div class="row">
-                <input type="number" class="order" data-rel="{{ $f.Rel }}" min="1" step="1" placeholder="#">
-                <button type="button" class="btn small previewBtn">Preview</button>
-              </div>
-            </td>
-          </tr>
-          {{end}}
-        </tbody>
-      </table>
+      <div id="list" class="list">
+        {{range .Items}}
+        <div class="card" data-title="{{.Title}}" data-pdf="{{.PDFURL}}">
+          <img class="thumb" loading="lazy" src="{{.IMGURL}}" alt="thumb" onerror="this.style.display='none'">
+          <div class="meta">
+            <input type="checkbox" class="pick" title="Select" />
+            <div style="flex:1; min-width:0">
+              <div class="title" title="{{.Title}}">{{.Title}}</div>
+              <div class="muted" style="word-break:break-all">{{.PDFURL}}</div>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; padding:0 12px 12px 12px;">
+            <input type="number" class="order" min="1" step="1" placeholder="# order">
+            <button type="button" class="btn small" onclick="preview(this)">Preview</button>
+          </div>
+        </div>
+        {{end}}
+      </div>
     </div>
 
     <div class="side">
-      <h3>Output</h3>
-      <div style="margin-bottom:12px;">
-        <label>Output filename (no spaces/ext):</label>
-        <input id="outname" type="text" placeholder="merged_kiddo">
-        <div class="muted">Lưu tại <code>{{.OutDir}}</code></div>
+      <div class="box" style="margin-bottom:12px;">
+        <h3 style="margin:0 0 8px 0">Output</h3>
+        <div class="row">
+          <input id="outname" type="text" placeholder="merged_kiddo">
+          <button id="mergeBtn" class="btn">Merge</button>
+        </div>
+        <div id="status" style="margin-top:10px;"></div>
       </div>
 
-      <button id="mergeBtn" class="btn">Merge selected PDFs</button>
-      <div id="status" style="margin-top:12px;"></div>
-
-      <hr>
-      <h3>Preview</h3>
-      <div id="previewBox" style="height:420px;border:1px solid #eee;border-radius:8px;overflow:hidden;">
-        <iframe id="previewFrame" src="" style="width:100%;height:100%;border:0;" title="Preview"></iframe>
+      <div class="box">
+        <h3 style="margin:0 0 8px 0">Preview</h3>
+        <iframe id="pv" src="" title="Preview"></iframe>
+        <div class="muted">Xem trực tiếp PDF qua <code>pdf_url</code> (nếu site không chặn iFrame).</div>
       </div>
-      <div class="muted">Chọn một file (tick hoặc nút Preview) để xem trước.</div>
     </div>
   </div>
 
 <script>
-  const tbody = document.getElementById('tbody');
-  const badge = document.getElementById('countBadge');
+  const list = document.getElementById('list');
+  const q = document.getElementById('q');
+  const label = document.getElementById('countLabel');
 
-  function setPreview(rel) {
-    if (!rel) return;
-    document.getElementById('previewFrame').src = '/file?rel=' + encodeURIComponent(rel) + '#page=1&zoom=page-width';
+  function countShown() {
+    const cards = Array.from(list.children);
+    const shown = cards.filter(c => c.style.display !== 'none').length;
+    label.textContent = shown + ' items';
   }
+  countShown();
 
-  function currentPicks() {
-    return Array.from(document.querySelectorAll('.pick:checked')).map(cb => cb.getAttribute('data-rel'));
-  }
-
-  function collectSelection() {
-    const picks = currentPicks();
-    // map rel -> order (number)
-    const orders = {};
-    document.querySelectorAll('.order').forEach(inp => {
-      const rel = inp.getAttribute('data-rel');
-      const v = parseInt(inp.value || "0", 10);
-      if (!isNaN(v) && v > 0) orders[rel] = v;
+  q.addEventListener('input', () => {
+    const term = (q.value || '').toLowerCase();
+    Array.from(list.children).forEach(c => {
+      const title = (c.getAttribute('data-title')||'').toLowerCase();
+      c.style.display = title.includes(term) ? '' : 'none';
     });
-
-    // sort by order then by name
-    const ordered = picks.slice().sort((a, b) => {
-      const oa = (orders[a] || 1e9);
-      const ob = (orders[b] || 1e9);
-      if (oa !== ob) return oa - ob;
-      return a.localeCompare(b);
-    });
-    return ordered;
-  }
-
-  // Filter by query
-  function filterRows(q) {
-    const rows = tbody.querySelectorAll('tr.fileRow');
-    let shown = 0;
-    rows.forEach(tr => {
-      const name = (tr.getAttribute('data-name') || '').toLowerCase();
-      const match = !q || name.includes(q);
-      tr.style.display = match ? '' : 'none';
-      if (match) shown++;
-    });
-    badge.textContent = shown + ' files';
-  }
-
-  // Initialize counts
-  filterRows('');
-
-  // Search input
-  document.getElementById('q').addEventListener('input', (e) => {
-    filterRows((e.target.value || '').toLowerCase());
+    countShown();
   });
 
-  // Row click handlers
-  tbody.addEventListener('click', (e) => {
-    const row = e.target.closest('tr.fileRow');
-    if (!row) return;
+  function preview(btn) {
+    const card = btn.closest('.card');
+    const pdf = card.getAttribute('data-pdf');
+    document.getElementById('pv').src = pdf + '#page=1&zoom=page-width';
+  }
 
-    if (e.target.classList.contains('previewBtn')) {
-      setPreview(row.getAttribute('data-rel'));
-    }
-    if (e.target.classList.contains('pick')) {
-      const rel = e.target.getAttribute('data-rel');
-      // Preview the 1st picked
-      if (document.querySelectorAll('.pick:checked').length === 1) setPreview(rel);
-    }
-  });
+  function selection() {
+    const entries = [];
+    Array.from(list.children).forEach(c => {
+      if (c.style.display === 'none') return;
+      const pick = c.querySelector('.pick');
+      if (!pick.checked) return;
+      const order = parseInt(c.querySelector('.order').value || '0', 10);
+      entries.push({pdf: c.getAttribute('data-pdf'), ord: order > 0 ? order : 1e9, title: c.getAttribute('data-title')});
+    });
+    entries.sort((a,b) => a.ord - b.ord || a.title.localeCompare(b.title));
+    return entries.map(e => e.pdf);
+  }
 
-  // Merge
   document.getElementById('mergeBtn').addEventListener('click', async () => {
-    const list = collectSelection();
-    const name = (document.getElementById('outname').value || 'merged_kiddo').replace(/\s+/g, '_');
-
-    if (list.length < 2) {
-      document.getElementById('status').innerHTML = '<span style="color:#c00">Chọn ít nhất 2 file.</span>';
+    const files = selection();
+    const out = (document.getElementById('outname').value || 'merged_kiddo').replace(/\s+/g, '_');
+    const status = document.getElementById('status');
+    if (files.length < 2) {
+      status.innerHTML = '<span style="color:#c00">Chọn ít nhất 2 item.</span>';
       return;
     }
-
-    document.getElementById('mergeBtn').disabled = true;
-    document.getElementById('status').textContent = 'Merging...';
-
-    try {
-      const resp = await fetch('/merge', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ files: list, out: name })
-      });
-      const data = await resp.json();
-      if (resp.ok) {
-        document.getElementById('status').innerHTML = '✅ Done: <a href="' + data.download + '" target="_blank" rel="noreferrer">' + data.download + '</a>';
-      } else {
-        document.getElementById('status').innerHTML = '❌ '+ (data.error || 'Merge error');
-      }
-    } catch (e) {
-      document.getElementById('status').textContent = '❌ ' + e;
-    } finally {
-      document.getElementById('mergeBtn').disabled = false;
+    status.textContent = 'Downloading & merging...';
+    const resp = await fetch('/merge', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({files, out})
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      status.innerHTML = '✅ Done: <a href="'+data.download+'" target="_blank" rel="noreferrer">'+data.download+'</a>';
+    } else {
+      status.innerHTML = '❌ ' + (data.error || 'Merge failed');
     }
   });
 </script>
@@ -251,40 +218,39 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
 </html>
 `))
 
-// ---- flags ----
-var (
-	rootDirFlag = flag.String("root", defaultRoot, "root directory to scan PDFs")
-	addrFlag    = flag.String("addr", listenAddr, "http listen address (e.g. :8080)")
-)
+// ======================= MAIN ========================
 
 func main() {
 	flag.Parse()
-	root := *rootDirFlag
 
-	// Ensure output dir exists
-	if err := os.MkdirAll(filepath.Join(root, outSubDir), 0o755); err != nil {
+	// Load items from data file
+	items, err := loadItems(*dataPath)
+	if err != nil {
+		log.Fatalf("load items: %v", err)
+	}
+	if len(items) == 0 {
+		log.Printf("Warning: no items found in %s", *dataPath)
+	}
+
+	// Ensure output dir
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		log.Fatal(err)
 	}
 
-	// Handlers using closure over 'root'
+	// Index
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		files, err := scanPDFs(root)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("[scan] found %d PDFs under %s", len(files), root)
-		sort.Slice(files, func(i, j int) bool { return files[i].Mod.After(files[j].Mod) })
+		// sort by Title asc
+		sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Title) < strings.ToLower(items[j].Title) })
 		data := struct {
-			Files        []FileItem
-			OutDir, Root string
-		}{files, filepath.Join(root, outSubDir), root}
+			Items []Item
+		}{Items: items}
 		_ = page.Execute(w, data)
 	})
 
+	// Merge endpoint: download then merge
 	http.HandleFunc("/merge", func(w http.ResponseWriter, r *http.Request) {
 		type req struct {
-			Files []string `json:"files"` // relative paths
+			Files []string `json:"files"`
 			Out   string   `json:"out"`
 		}
 		var in req
@@ -300,110 +266,198 @@ func main() {
 		if outName == "" {
 			outName = "merged_kiddo"
 		}
-		outName = sanitize(outName) + ".pdf"
+		outName = sanitizeNoExt(outName) + ".pdf"
+		outPath := filepath.Join(*outDir, outName)
 
-		// Build absolute input paths and validate they are inside root
-		var absInputs []string
-		for _, rel := range in.Files {
-			ap := filepath.Join(root, filepath.FromSlash(rel))
-			if !strings.HasPrefix(abs(ap)+string(os.PathSeparator), abs(root)+string(os.PathSeparator)) {
-				http.Error(w, `{"error":"invalid path"}`, http.StatusBadRequest)
-				return
+		tmpDir, err := os.MkdirTemp("", "merge_dl_*")
+		if err != nil {
+			http.Error(w, `{"error":"cannot create temp dir"}`, http.StatusInternalServerError)
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+
+		var localFiles []string
+		var skipped []string
+
+		for i, u := range in.Files {
+			lp := filepath.Join(tmpDir, "f_"+strconv.Itoa(i)+".pdf")
+			if err := downloadPDF(u, lp); err != nil {
+				log.Printf("[skip] %s -> %v", u, err)
+				skipped = append(skipped, u)
+				continue
 			}
-			if st, err := os.Stat(ap); err != nil || !st.Mode().IsRegular() {
-				http.Error(w, `{"error":"file not found: `+escape(rel)+`"}`, http.StatusNotFound)
-				return
-			}
-			absInputs = append(absInputs, ap)
+			localFiles = append(localFiles, lp)
 		}
 
-		outPath := filepath.Join(root, outSubDir, outName)
+		if len(localFiles) < 2 {
+			http.Error(w, `{"error":"not enough valid PDFs to merge","skipped":"`+escape(strings.Join(skipped, ","))+`"}`, http.StatusBadRequest)
+			return
+		}
 
-		// Merge via pdfcpu API
-		if err := pdfapi.MergeCreateFile(absInputs, outPath, false, nil); err != nil {
-			// fallback: try append mode (older pdfcpu versions)
-			if e2 := pdfapi.MergeAppendFile(absInputs, outPath, false, nil); e2 != nil {
-				http.Error(w, `{"error":"merge failed: `+escape(err.Error())+`"}`, http.StatusInternalServerError)
+		if err := pdfapi.MergeCreateFile(localFiles, outPath, false, nil); err != nil {
+			if e2 := pdfapi.MergeAppendFile(localFiles, outPath, false, nil); e2 != nil {
+				http.Error(w, `{"error":"merge failed"}`, http.StatusInternalServerError)
 				return
 			}
 		}
 
-		resp := map[string]string{
-			"ok":       "1",
+		resp := map[string]any{
+			"ok":       1,
 			"download": "/download/" + urlPath(outName),
+			"skipped":  skipped,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// Serve merged files for download
-	http.Handle("/download/", http.StripPrefix("/download/",
-		http.FileServer(http.Dir(filepath.Join(root, outSubDir))),
-	))
+	// Serve merged outputs
+	http.Handle("/download/", http.StripPrefix("/download/", http.FileServer(http.Dir(*outDir))))
 
-	// Serve original PDF for preview (inline)
-	http.HandleFunc("/file", func(w http.ResponseWriter, r *http.Request) {
-		rel := r.URL.Query().Get("rel")
-		if rel == "" {
-			http.Error(w, "missing rel", http.StatusBadRequest)
-			return
-		}
-		ap := filepath.Join(root, filepath.FromSlash(rel))
-		// prevent traversal
-		if !strings.HasPrefix(abs(ap)+string(os.PathSeparator), abs(root)+string(os.PathSeparator)) {
-			http.Error(w, "invalid path", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/pdf")
-		http.ServeFile(w, r, ap)
-	})
-
-	log.Printf("PDF Merger UI at http://localhost%v  (root: %s)", *addrFlag, root)
+	log.Printf("UI: http://localhost%s  | data=%s  | out=%s", *addrFlag, *dataPath, *outDir)
 	log.Fatal(http.ListenAndServe(*addrFlag, nil))
 }
 
-// ---- utilities ----
+// ======================= HELPERS ======================
 
-func scanPDFs(root string) ([]FileItem, error) {
-	var files []FileItem
-	count := 0
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+func loadItems(path string) ([]Item, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	// detect jsonl vs json array
+	if strings.HasSuffix(strings.ToLower(path), ".jsonl") {
+		var items []Item
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			var it Item
+			if err := json.Unmarshal([]byte(line), &it); err != nil {
+				return nil, err
+			}
+			// basic validation
+			if it.PDFURL == "" {
+				continue
+			}
+			items = append(items, it)
+		}
+		return items, sc.Err()
+	}
+
+	// else treat as JSON array
+	var items []Item
+	if err := json.NewDecoder(f).Decode(&items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// replace the existing downloadPDF with this smarter version:
+
+func downloadPDF(u, outPath string) error {
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	// 1) Try GET u
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "WorksheetMerger/1.1 (+https://example.local)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// handle redirects already followed by http.Client
+	if resp.StatusCode >= 400 {
+		return errors.New("http " + strconv.Itoa(resp.StatusCode))
+	}
+
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "pdf") || strings.HasSuffix(strings.ToLower(u), ".pdf") || ct == "application/octet-stream" {
+		// looks like a PDF (some servers use octet-stream)
+		f, err := os.Create(outPath)
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
-			return nil
+		defer f.Close()
+		_, err = io.Copy(f, resp.Body)
+		return err
+	}
+
+	// 2) If HTML, try to extract a direct .pdf from the page
+	if strings.Contains(ct, "text/html") {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
 		}
-		name := strings.ToLower(d.Name())
-		if strings.HasSuffix(name, ".pdf") {
-			info, _ := d.Info()
-			rel, _ := filepath.Rel(root, path)
-			files = append(files, FileItem{
-				Path: path,
-				Rel:  filepath.ToSlash(rel),
-				Size: info.Size(),
-				Mod:  info.ModTime(),
-			})
-			count++
-			if count >= maxFileScan {
-				return filepath.SkipAll
-			}
+		pdfURL := findPDFLinkInHTML(string(body), u)
+		if pdfURL == "" {
+			// as a last chance: sometimes anchor text has 'download'
+			return fmt.Errorf("no direct PDF link found in HTML page: %s", u)
 		}
-		return nil
+		// recursive call to download the real PDF
+		return downloadPDF(pdfURL, outPath)
+	}
+
+	// 3) Unknown type
+	return fmt.Errorf("unsupported content-type %s for %s", ct, u)
+}
+
+// Parse HTML to find a <a href="...pdf"> or an anchor whose text contains Download/PDF.
+func findPDFLinkInHTML(html, base string) string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+	if err != nil {
+		return ""
+	}
+	var candidates []string
+
+	doc.Find("a[href]").Each(func(_ int, a *goquery.Selection) {
+		href, _ := a.Attr("href")
+		txt := strings.ToLower(strings.TrimSpace(a.Text()))
+		abs := mustAbsURL(base, href)
+		l := strings.ToLower(abs)
+		switch {
+		case strings.HasSuffix(l, ".pdf"):
+			candidates = append(candidates, abs)
+		case strings.Contains(txt, "download") || strings.Contains(txt, "pdf"):
+			candidates = append(candidates, abs)
+		}
 	})
-	return files, err
+
+	// prefer .pdf endings
+	for _, c := range candidates {
+		if strings.HasSuffix(strings.ToLower(c), ".pdf") {
+			return c
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+	return ""
 }
 
-func abs(p string) string {
-	a, _ := filepath.Abs(p)
-	return a
+func mustAbsURL(baseStr, href string) string {
+	bu, err := url.Parse(baseStr)
+	if err != nil {
+		return href
+	}
+	hu, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	return bu.ResolveReference(hu).String()
 }
 
-func sanitize(s string) string {
-	// keep letters, numbers, dash, underscore and dots (for optional sub-name)
+func sanitizeNoExt(s string) string {
 	var b strings.Builder
 	for _, r := range s {
-		if r == '-' || r == '_' || r == '.' ||
+		if r == '-' || r == '_' ||
 			(r >= 'a' && r <= 'z') ||
 			(r >= 'A' && r <= 'Z') ||
 			(r >= '0' && r <= '9') {
@@ -413,12 +467,7 @@ func sanitize(s string) string {
 	if b.Len() == 0 {
 		return "merged"
 	}
-	// ensure no double extension
-	out := b.String()
-	if strings.HasSuffix(strings.ToLower(out), ".pdf") {
-		out = strings.TrimSuffix(out, ".pdf")
-	}
-	return out
+	return b.String()
 }
 
 func escape(s string) string {
@@ -427,10 +476,4 @@ func escape(s string) string {
 
 func urlPath(name string) string {
 	return strings.ReplaceAll(name, " ", "_")
-}
-
-// optional helper: parse int safely (unused here)
-func atoiSafe(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
 }
