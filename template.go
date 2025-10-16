@@ -115,7 +115,47 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
   const subjectSel = document.getElementById('subject');
   const label = document.getElementById('countLabel');
 
-  // Build subject dropdown from items on page
+  // --- STATE PERSISTENCE ---
+  // Giữ các PDF đã chọn (theo URL) và order tương ứng, cùng tiêu đề để sort
+  const selected = new Set();             // Set<string pdfUrl>
+  const orderMap = new Map();             // Map<string pdfUrl, number>
+  const titleMap = new Map();             // Map<string pdfUrl, string>
+
+  // Khởi tạo titleMap và gắn listeners cho từng card
+  (function initCards(){
+    Array.from(list.children).forEach(card => {
+      const pdf = card.getAttribute('data-pdf');
+      const title = card.getAttribute('data-title') || '';
+      titleMap.set(pdf, title);
+
+      const cb = card.querySelector('.pick');
+      const orderInput = card.querySelector('.order');
+
+      // Khi check/uncheck -> cập nhật selected
+      cb.addEventListener('change', () => {
+        if (cb.checked) {
+          selected.add(pdf);
+          // nếu đang có order input, lưu luôn
+          const v = parseInt(orderInput.value || '0', 10);
+          if (v > 0) orderMap.set(pdf, v);
+        } else {
+          selected.delete(pdf);
+          // KHÔNG xóa orderMap để người dùng quay lại vẫn còn thứ tự (tuỳ)
+          // nếu muốn xoá luôn: orderMap.delete(pdf);
+        }
+        syncBadge();
+      });
+
+      // Khi user sửa order -> cập nhật orderMap nếu >0
+      orderInput.addEventListener('input', () => {
+        const v = parseInt(orderInput.value || '0', 10);
+        if (v > 0) orderMap.set(pdf, v);
+        else orderMap.delete(pdf);
+      });
+    });
+  })();
+
+  // Build subject dropdown từ dữ liệu trên trang
   (function initSubjects(){
     const subjects = new Set();
     Array.from(list.children).forEach(c => {
@@ -136,29 +176,40 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
     const subj = (subjectSel.value || '').toLowerCase();
 
     let shown = 0;
-    Array.from(list.children).forEach(c => {
-      const title = (c.getAttribute('data-title')||'').toLowerCase();
-      const s = (c.getAttribute('data-subject')||'').toLowerCase();
+    Array.from(list.children).forEach(card => {
+      const title = (card.getAttribute('data-title')||'').toLowerCase();
+      const s = (card.getAttribute('data-subject')||'').toLowerCase();
       const matchTitle = !term || title.includes(term);
       const matchSubject = !subj || (s && (s === subj || s.includes(subj)));
       const visible = matchTitle && matchSubject;
-      c.style.display = visible ? '' : 'none';
+      card.style.display = visible ? '' : 'none';
+
+      // Khôi phục trạng thái checkbox & order từ state
+      const pdf = card.getAttribute('data-pdf');
+      const cb = card.querySelector('.pick');
+      const orderInput = card.querySelector('.order');
+      cb.checked = selected.has(pdf);
+      if (orderMap.has(pdf)) orderInput.value = orderMap.get(pdf);
+
       if (visible) shown++;
     });
     label.textContent = shown + ' items';
+    syncBadge();
   }
 
-  function countShown() {
-    let shown = 0;
-    Array.from(list.children).forEach(c => { if (c.style.display !== 'none') shown++; });
-    label.textContent = shown + ' items';
+  function syncBadge() {
+    // Hiển thị số lượng đang chọn (không phụ thuộc filter)
+    const existing = document.getElementById('selCount');
+    const count = selected.size;
+    if (!existing) {
+      const span = document.createElement('span');
+      span.id = 'selCount';
+      span.className = 'small';
+      span.style.marginLeft = '8px';
+      subjectSel.insertAdjacentElement('afterend', span);
+    }
+    document.getElementById('selCount').textContent = 'Selected: ' + count;
   }
-
-  // initial count
-  countShown();
-
-  q.addEventListener('input', applyFilters);
-  subjectSel.addEventListener('change', applyFilters);
 
   function preview(btn) {
     const card = btn.closest('.card');
@@ -166,18 +217,24 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
     document.getElementById('pv').src = pdf + '#page=1&zoom=page-width';
   }
 
+  // Lấy danh sách đã chọn từ state (không phụ thuộc còn hiển thị hay không)
   function selection() {
-    const entries = [];
-    Array.from(list.children).forEach(c => {
-      if (c.style.display === 'none') return;
-      const pick = c.querySelector('.pick');
-      if (!pick.checked) return;
-      const order = parseInt(c.querySelector('.order').value || '0', 10);
-      entries.push({pdf: c.getAttribute('data-pdf'), ord: order > 0 ? order : 1e9, title: c.getAttribute('data-title')});
-    });
-    entries.sort((a,b) => a.ord - b.ord || a.title.localeCompare(b.title));
-    return entries.map(e => e.pdf);
+    const arr = Array.from(selected).map(pdf => ({
+      pdf,
+      ord: orderMap.get(pdf) || 1e9,
+      title: titleMap.get(pdf) || ''
+    }));
+    arr.sort((a,b) => a.ord - b.ord || a.title.localeCompare(b.title));
+    return arr.map(e => e.pdf);
   }
+
+  // initial render
+  (function firstRender(){
+    applyFilters(); // cũng sẽ sync lại checkbox/order nếu có
+  })();
+
+  q.addEventListener('input', applyFilters);
+  subjectSel.addEventListener('change', applyFilters);
 
   document.getElementById('mergeBtn').addEventListener('click', async () => {
     const files = selection();
@@ -193,12 +250,26 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({files, out})
     });
-    const data = await resp.json();
+    if (resp.headers.get('Content-Type')?.includes('application/pdf')) {
+      // Trường hợp API trả stream PDF trực tiếp (khi deploy serverless)
+      const blob = await resp.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = out + '.pdf';
+      a.click();
+      status.innerHTML = '✅ Downloaded merged PDF.';
+      return;
+    }
+    const data = await resp.json().catch(()=>({}));
     if (resp.ok) {
-      status.innerHTML = '✅ Done: <a href="'+data.download+'" target="_blank" rel="noreferrer">'+data.download+'</a>'
-        + (data.skipped && data.skipped.length ? '<div class="muted">Skipped: '+data.skipped.length+'</div>' : '');
+      // Trường hợp server trả link tải
+      status.innerHTML = '✅ Done: '
+        + (data.download ? '<a href="'+data.download+'" target="_blank" rel="noreferrer">'+data.download+'</a>' : 'Merged');
+      if (data.skipped && data.skipped.length) {
+        status.innerHTML += '<div class="muted">Skipped: '+data.skipped.length+'</div>';
+      }
     } else {
-      status.innerHTML = '❌ ' + (data.error || 'Merge failed');
+      status.innerHTML = '❌ ' + (data?.error || 'Merge failed');
     }
   });
 </script>
