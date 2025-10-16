@@ -56,7 +56,7 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
   </style>
 </head>
 <body>
-  <h1>Worksheet Picker (from links)</h1>
+  <h1>Worksheet Picker</h1>
 
   <div class="toolbar">
     <input id="q" class="search" type="text" placeholder="Filter by title...">
@@ -104,7 +104,6 @@ var page = template.Must(template.New("index").Funcs(funcMap).Parse(`
       <div class="box">
         <h3 style="margin:0 0 8px 0">Preview</h3>
         <iframe id="pv" src="" title="Preview"></iframe>
-        <div class="muted">Xem trực tiếp PDF qua <code>pdf_url</code> (nếu site không chặn iFrame).</div>
       </div>
     </div>
   </div>
