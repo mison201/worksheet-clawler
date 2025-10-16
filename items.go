@@ -3,16 +3,12 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -22,130 +18,6 @@ const (
 	listPath  = "/all-downloads/"
 	userAgent = "KiddoCrawler-Items/1.0 (+https://example.local)"
 )
-
-var (
-	outPath     = flag.String("out", "items.jsonl", "output file: .jsonl (default) or .json")
-	startPage   = flag.Int("start", 1, "start page number")
-	endPage     = flag.Int("end", 0, "end page number (0 = auto detect)")
-	maxItems    = flag.Int("max", 0, "max items to collect (0 = unlimited)")
-	delayMs     = flag.Int("delay", 1200, "delay between requests in milliseconds")
-	debugLog    = flag.Bool("debug", false, "verbose logging")
-	httpTimeout = flag.Int("timeout", 30, "HTTP timeout seconds")
-)
-
-func itemMain() {
-	flag.Parse()
-
-	client := &http.Client{Timeout: time.Duration(*httpTimeout) * time.Second}
-
-	// Mở file output
-	if err := os.MkdirAll(filepath.Dir(absPath(*outPath)), 0o755); err != nil && !os.IsExist(err) {
-		log.Fatal(err)
-	}
-
-	// Thu thập items
-	var items []Item
-
-	// Tìm số trang tối đa nếu endPage=0
-	pages := *endPage
-	if pages == 0 {
-		n, err := findMaxPages(client)
-		if err != nil {
-			log.Printf("[warn] cannot detect max pages: %v -> fallback 100", err)
-			pages = 100
-		} else {
-			pages = n
-		}
-	}
-	if *debugLog {
-		log.Printf("[info] scanning pages %d..%d", *startPage, pages)
-	}
-
-	count := 0
-	for p := *startPage; p <= pages; p++ {
-		listURL := resolveListURL(p)
-		if *debugLog {
-			log.Printf("[list] %s", listURL)
-		}
-		doc, err := fetchDoc(client, listURL)
-		if err != nil {
-			log.Printf("[list] skip page %d: %v", p, err)
-			continue
-		}
-
-		// Dò link vào detail
-		detailLinks := extractDetailLinks(doc, baseURL)
-		if *debugLog {
-			log.Printf("  found %d detail links", len(detailLinks))
-		}
-
-		// Lấy fallback thumbnail (từ listing) cho từng detail nếu có thể
-		thumbByDetail := map[string]string{}
-		doc.Find("a[href]").Each(func(_ int, a *goquery.Selection) {
-			href, _ := a.Attr("href")
-			href = toAbs(href)
-			if !isDetailURL(href) {
-				return
-			}
-			// thử lấy ảnh con trong a > img
-			if img := a.Find("img"); img.Length() > 0 {
-				if src, ok := img.Attr("src"); ok && src != "" {
-					thumbByDetail[href] = toAbs(src)
-				}
-			}
-		})
-
-		for _, durl := range detailLinks {
-			if *maxItems > 0 && count >= *maxItems {
-				break
-			}
-			// tôn trọng delay
-			time.Sleep(time.Duration(*delayMs) * time.Millisecond)
-
-			item, err := parseDetail(client, durl)
-			if err != nil {
-				if *debugLog {
-					log.Printf("  [detail] %s -> %v", durl, err)
-				}
-				continue
-			}
-			// nếu thiếu ảnh thì dùng fallback từ listing
-			if item.IMGURL == "" {
-				if tb, ok := thumbByDetail[durl]; ok {
-					item.IMGURL = tb
-				}
-			}
-			// đủ dữ liệu tối thiểu?
-			if item.Title == "" || item.PDFURL == "" {
-				if *debugLog {
-					log.Printf("  [skip] missing title/pdf for %s", durl)
-				}
-				continue
-			}
-
-			items = append(items, item)
-			count++
-			if *debugLog {
-				log.Printf("  [+] %s", item.Title)
-			}
-		}
-		if *maxItems > 0 && count >= *maxItems {
-			break
-		}
-	}
-
-	// Ghi ra file
-	if strings.HasSuffix(strings.ToLower(*outPath), ".jsonl") {
-		if err := writeJSONL(*outPath, items); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		if err := writeJSONArray(*outPath, items); err != nil {
-			log.Fatal(err)
-		}
-	}
-	log.Printf("Done. Wrote %d items -> %s", len(items), *outPath)
-}
 
 func findMaxPages(client *http.Client) (int, error) {
 	doc, err := fetchDoc(client, baseURL+listPath)
@@ -173,20 +45,6 @@ func resolveListURL(p int) string {
 		return baseURL + listPath
 	}
 	return fmt.Sprintf("%s/all-downloads/page/%d/", baseURL, p)
-}
-
-func fetchDoc(client *http.Client, u string) (*goquery.Document, error) {
-	req, _ := http.NewRequest("GET", u, nil)
-	req.Header.Set("User-Agent", userAgent)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	return goquery.NewDocumentFromReader(resp.Body)
 }
 
 func extractDetailLinks(doc *goquery.Document, base string) []string {
@@ -229,7 +87,7 @@ func parseDetail(client *http.Client, detailURL string) (Item, error) {
 	}
 
 	// title
-	title := strings.TrimSpace(doc.Find("h1").First().Text())
+	title := cleanText(doc.Find("h1").First().Text())
 	if title == "" {
 		title = fallbackTitle(detailURL)
 	}
@@ -251,9 +109,7 @@ func parseDetail(client *http.Client, detailURL string) (Item, error) {
 		}
 	})
 	// prefer direct .pdf
-	if !strings.HasSuffix(strings.ToLower(pdf), ".pdf") {
-		// để nguyên; một số trang có redirect download
-	}
+	// (nếu không đuôi .pdf, để nguyên — có thể là link tải có redirect)
 
 	// image: prefer OG image
 	var img string
@@ -270,11 +126,69 @@ func parseDetail(client *http.Client, detailURL string) (Item, error) {
 		}
 	}
 
+	// subject: chiến lược nhiều lớp
+
+	// 1) Dò các dòng có "Subject:" trong li/p/div
+	subject := ""
+	doc.Find("li, p, div").Each(func(_ int, s *goquery.Selection) {
+		if subject != "" {
+			return
+		}
+		t := strings.ToLower(strings.TrimSpace(s.Text()))
+		if strings.HasPrefix(t, "subject") {
+			raw := cleanText(s.Text())
+			if val := strings.TrimSpace(afterColon(raw)); val != "" {
+				subject = val
+			}
+		}
+	})
+
+	// 2) Nếu chưa có: tìm label đậm/strong "Subject:" + sibling
+	if subject == "" {
+		doc.Find("strong,b").Each(func(_ int, s *goquery.Selection) {
+			if subject != "" {
+				return
+			}
+			txt := strings.ToLower(strings.TrimSpace(s.Text()))
+			if strings.HasPrefix(txt, "subject") {
+				// lấy nguyên node text cha
+				raw := cleanText(s.Parent().Text())
+				val := strings.TrimSpace(afterColon(raw))
+				if val == "" {
+					// thử next sibling text
+					if sib := s.Parent().Next(); sib.Length() > 0 {
+						val = cleanText(sib.Text())
+					}
+				}
+				if val != "" {
+					subject = val
+				}
+			}
+		})
+	}
+
+	// 3) Nếu vẫn chưa có: thử lấy từ category/tag
+	if subject == "" {
+		var candidates []string
+		doc.Find(`a[rel="category tag"], a[href*="/category/"], a[href*="/tags/"], a[href*="/tag/"]`).Each(func(_ int, a *goquery.Selection) {
+			t := cleanText(a.Text())
+			if t != "" {
+				candidates = append(candidates, t)
+			}
+		})
+		if s := pickLikelySubject(candidates); s != "" {
+			subject = s
+		} else if len(candidates) > 0 {
+			subject = candidates[0]
+		}
+	}
+
 	return Item{
-		Title:  title,
-		PDFURL: pdf,
-		IMGURL: img,
-		URL:    detailURL,
+		Title:   title,
+		PDFURL:  pdf,
+		IMGURL:  img,
+		URL:     detailURL,
+		Subject: subject,
 	}, nil
 }
 
@@ -353,13 +267,43 @@ func atoiSafe(s string) int {
 	return n
 }
 
-func absPath(p string) string {
-	if p == "" {
-		return "."
+// cleanText: collapse whitespace
+func cleanText(s string) string {
+	s = strings.TrimSpace(s)
+	s = regexp.MustCompile(`\s+`).ReplaceAllString(s, " ")
+	return s
+}
+
+func afterColon(s string) string {
+	i := strings.IndexRune(s, ':')
+	if i < 0 {
+		return s
 	}
-	ap, err := filepath.Abs(p)
-	if err != nil {
-		return p
+	return s[i+1:]
+}
+
+// pickLikelySubject: ưu tiên các subject phổ biến
+func pickLikelySubject(cands []string) string {
+	if len(cands) == 0 {
+		return ""
 	}
-	return ap
+	// map từ khóa -> ưu tiên
+	keywords := []string{
+		"math", "english", "phonics", "reading", "writing",
+		"science", "social studies", "colors", "shapes",
+		"numbers", "counting", "tracing", "alphabet", "letters",
+		"grammar", "vocabulary",
+	}
+	lc := make([]string, len(cands))
+	for i, c := range cands {
+		lc[i] = strings.ToLower(c)
+	}
+	for _, kw := range keywords {
+		for i, v := range lc {
+			if strings.Contains(v, kw) {
+				return cands[i]
+			}
+		}
+	}
+	return ""
 }
