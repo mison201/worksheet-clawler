@@ -19,6 +19,11 @@ var (
 	endPage     = flag.Int("end", 0, "end page number (0 = auto detect)")
 	delayMs     = flag.Int("delay", 1200, "delay between requests in milliseconds")
 	maxItemsRun = flag.Int("max", 0, "max items to collect this run (0 = unlimited)")
+
+	crawlWSF = flag.Bool("crawl_wsfun", false, "also crawl worksheetfun.com before starting UI")
+	wsfData  = flag.String("wsf_data", "wsfun_items.jsonl", "output for worksheetfun items")
+	wsfCP    = flag.String("wsf_cp", "wsfun.checkpoint.json", "checkpoint file for worksheetfun crawl")
+	wsfCat   = flag.String("wsf_cat", "", "WorksheetFun category URL to crawl (e.g. https://www.worksheetfun.com/category/.../page/1)")
 )
 
 func main() {
@@ -36,6 +41,20 @@ func main() {
 			UserAgent: userAgent, // từ crawler
 		}); err != nil {
 			log.Printf("[crawl] warning: %v", err)
+		}
+	}
+
+	if *crawlWSF {
+		if err := RunWSFunCrawlerWithCheckpoint(WSFCrawlConfig{
+			DataPath:        *wsfData,
+			CPPath:          *wsfCP,
+			StartPage:       1, // sẽ bị override bởi checkpoint nếu có
+			EndPage:         0, // auto detect
+			DelayMs:         *delayMs,
+			MaxItems:        *maxItemsRun,
+			BaseCategoryURL: *wsfCat,
+		}); err != nil {
+			log.Printf("[wsfun] warning: %v", err)
 		}
 	}
 
