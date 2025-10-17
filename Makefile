@@ -8,7 +8,7 @@ sync_wsfun:
 	go run . \
 		-crawl=false \
 		-crawl_wsfun=true \
-		-wsf_cat "https://www.worksheetfun.com/category/most-popular-preschool-and-kindergarten-worksheets/page/1" \
+		-wsf_cat "https://www.worksheetfun.com/category/grades/preschool/page/1" \
 		-wsf_data wsfun_items.jsonl \
 		-wsf_cp wsfun.checkpoint.json \
 		-delay 1200 \
@@ -18,7 +18,4 @@ merge_items:
 	cat kiddo_items.jsonl wsfun_items.jsonl > items.jsonl
 
 clean:
-	rm -f kiddo
-
-test:
-	go test .
+	rm -f kiddo merged_output

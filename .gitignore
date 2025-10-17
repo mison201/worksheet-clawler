@@ -1,3 +1,8 @@
 data_kiddo
 .DS_Store
 merged_output
+kiddo_items.jsonl
+.gitignore
+wsfun.checkpoint.json
+wsfun_items.jsonl
+kiddo.checkpoint.json
